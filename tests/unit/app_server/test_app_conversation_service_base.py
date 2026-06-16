@@ -15,6 +15,8 @@ import pytest
 from openhands.app_server.app_conversation.app_conversation_models import AgentType
 from openhands.app_server.app_conversation.app_conversation_service_base import (
     AppConversationServiceBase,
+    extract_yaml_frontmatter,
+    normalize_dependency_repos,
 )
 from openhands.app_server.integrations.service_types import ProviderType
 from openhands.app_server.sandbox.sandbox_models import SandboxInfo, SandboxStatus
@@ -35,9 +37,10 @@ class MockUserInfo:
 class MockCommandResult:
     """Mock class for command execution result."""
 
-    def __init__(self, exit_code: int = 0, stderr: str = ''):
+    def __init__(self, exit_code: int = 0, stderr: str = '', stdout: str = ''):
         self.exit_code = exit_code
         self.stderr = stderr
+        self.stdout = stdout
 
 
 class MockWorkspace:
@@ -110,6 +113,67 @@ class MockAppConversationServiceBase:
 def service():
     """Create a mock service instance for testing."""
     return MockAppConversationServiceBase()
+
+
+def test_extracts_and_normalizes_dependency_repos_alias_format():
+    markdown = """---
+dependency_repos:
+- frontend: OpenHands/OpenHands
+- backend: OpenHands/software-agent-sdk
+---
+# Repo instructions
+"""
+
+    frontmatter = extract_yaml_frontmatter(markdown)
+
+    assert frontmatter is not None
+    assert normalize_dependency_repos(frontmatter.get('dependency_repos')) == [
+        ('frontend', 'OpenHands/OpenHands'),
+        ('backend', 'OpenHands/software-agent-sdk'),
+    ]
+
+
+def test_extracts_and_normalizes_dependency_repos_plain_string_format():
+    markdown = """---
+dependency_repos:
+- OpenHands/software-agent-sdk
+---
+# Repo instructions
+"""
+
+    frontmatter = extract_yaml_frontmatter(markdown)
+
+    assert frontmatter is not None
+    assert normalize_dependency_repos(frontmatter.get('dependency_repos')) == [
+        ('software-agent-sdk', 'OpenHands/software-agent-sdk')
+    ]
+
+
+@pytest.mark.parametrize(
+    'markdown',
+    [
+        '# Repo instructions\n',
+        """---
+dependency_repos:
+- OpenHands/software-agent-sdk
+""",
+        """---
+dependency_repos: [unterminated
+---
+""",
+    ],
+)
+def test_extract_yaml_frontmatter_ignores_missing_or_invalid_frontmatter(markdown):
+    assert extract_yaml_frontmatter(markdown) is None
+
+
+def test_normalize_dependency_repos_ignores_invalid_values():
+    assert normalize_dependency_repos(None) == []
+    assert normalize_dependency_repos({'frontend': 'OpenHands/OpenHands'}) == []
+    assert (
+        normalize_dependency_repos([123, {'frontend': 123}, {'': 'owner/repo'}])
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -764,6 +828,61 @@ def mock_workspace():
 
 
 @pytest.mark.asyncio
+async def test_clone_dependency_repos_from_repo_instructions_continues_on_clone_failure(
+    mock_workspace,
+):
+    user_info = MockUserInfo()
+    service, mock_user_context = _create_service_with_mock_user_context(
+        user_info,
+        bind_methods=(
+            '_read_dependency_repos_from_repo_instructions',
+            '_clone_dependency_repos_from_repo_instructions',
+        ),
+    )
+    mock_user_context.get_authenticated_git_url = AsyncMock(
+        return_value='https://github.com/OpenHands/software-agent-sdk.git'
+    )
+    markdown = """---
+dependency_repos:
+- OpenHands/software-agent-sdk
+---
+# Repo instructions
+"""
+
+    async def execute_command(command, *_args):
+        if command.startswith('find '):
+            return MockCommandResult(
+                stdout='/workspace/project/repo/.openhands/skills/repo.md\n'
+            )
+        if command.startswith('cat '):
+            return MockCommandResult(stdout=markdown)
+        if command.startswith('git clone '):
+            return MockCommandResult(exit_code=128, stderr='clone failed')
+        return MockCommandResult()
+
+    mock_workspace.execute_command = AsyncMock(side_effect=execute_command)
+
+    with patch(
+        'openhands.app_server.app_conversation.app_conversation_service_base._logger.warning'
+    ) as mock_warning:
+        await service._clone_dependency_repos_from_repo_instructions(
+            mock_workspace,
+            '/workspace/project/repo',
+        )
+
+    commands = [call.args[0] for call in mock_workspace.execute_command.call_args_list]
+    assert (
+        'git clone https://github.com/OpenHands/software-agent-sdk.git '
+        'software-agent-sdk'
+    ) in commands
+    assert any(
+        'Dependency repository clone failed for OpenHands/software-agent-sdk'
+        in call.args[0]
+        for call in mock_warning.call_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_clone_or_init_git_repo_quotes_selected_branch_before_checkout(
     mock_workspace,
 ):
@@ -772,6 +891,8 @@ async def test_clone_or_init_git_repo_quotes_selected_branch_before_checkout(
         user_info,
         bind_methods=(
             'clone_or_init_git_repo',
+            '_read_dependency_repos_from_repo_instructions',
+            '_clone_dependency_repos_from_repo_instructions',
             '_get_azure_devops_bearer_token_for_git',
         ),
     )
@@ -803,6 +924,8 @@ async def test_clone_or_init_git_repo_configures_dynamic_azure_devops_helper(
         user_info,
         bind_methods=(
             'clone_or_init_git_repo',
+            '_read_dependency_repos_from_repo_instructions',
+            '_clone_dependency_repos_from_repo_instructions',
             '_get_azure_devops_bearer_token_for_git',
             '_configure_azure_devops_git_credential_helper',
         ),

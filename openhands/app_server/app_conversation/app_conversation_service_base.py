@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     import httpx
 
 import base62
+import yaml
 
 from openhands.app_server.app_conversation.app_conversation_models import (
     AgentType,
@@ -48,6 +49,69 @@ from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWor
 _logger = logging.getLogger(__name__)
 PRE_COMMIT_HOOK = '.git/hooks/pre-commit'
 PRE_COMMIT_LOCAL = '.git/hooks/pre-commit.local'
+REPO_INSTRUCTION_DIRS = (
+    '.agents/skills',
+    '.openhands/skills',
+    '.openhands/microagents',
+)
+
+
+def extract_yaml_frontmatter(markdown_text: str) -> dict[str, Any] | None:
+    """Extract YAML frontmatter from markdown text."""
+    lines = markdown_text.splitlines()
+    if not lines or lines[0].strip() != '---':
+        return None
+
+    end_index = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == '---':
+            end_index = index
+            break
+
+    if end_index is None:
+        return None
+
+    try:
+        frontmatter = yaml.safe_load('\n'.join(lines[1:end_index]))
+    except yaml.YAMLError as exc:
+        _logger.warning(f'Invalid YAML frontmatter: {exc}')
+        return None
+
+    return frontmatter if isinstance(frontmatter, dict) else None
+
+
+def _dependency_repo_dir_name(repository: str) -> str:
+    repository = repository.strip().rstrip('/')
+    if repository.endswith('.git'):
+        repository = repository[:-4]
+    return repository.split('/')[-1]
+
+
+def normalize_dependency_repos(dependency_repos: Any) -> list[tuple[str, str]]:
+    """Normalize dependency_repos frontmatter into (directory, repository) pairs."""
+    if not isinstance(dependency_repos, list):
+        return []
+
+    normalized: list[tuple[str, str]] = []
+    for item in dependency_repos:
+        if isinstance(item, str):
+            repository = item.strip()
+            if repository:
+                normalized.append((_dependency_repo_dir_name(repository), repository))
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        for directory, repository in item.items():
+            if not isinstance(directory, str) or not isinstance(repository, str):
+                continue
+            directory = directory.strip()
+            repository = repository.strip()
+            if directory and repository:
+                normalized.append((directory, repository))
+
+    return normalized
 
 
 def get_project_dir(
@@ -402,6 +466,100 @@ class AppConversationServiceBase(AppConversationService, ABC):
         result = await workspace.execute_command(checkout_command, git_dir)
         if result.exit_code:
             _logger.warning(f'Git checkout failed: {result.stderr}')
+
+        await self._clone_dependency_repos_from_repo_instructions(
+            workspace,
+            get_project_dir(workspace.working_dir, request.selected_repository),
+        )
+
+    async def _read_dependency_repos_from_repo_instructions(
+        self,
+        workspace: AsyncRemoteWorkspace,
+        project_dir: str,
+    ) -> list[tuple[str, str]]:
+        quoted_instruction_dirs = ' '.join(
+            shlex.quote(f'{project_dir}/{instruction_dir}')
+            for instruction_dir in REPO_INSTRUCTION_DIRS
+        )
+        find_command = (
+            f'find {quoted_instruction_dirs} -type f -name "*.md" -print '
+            '2>/dev/null || true'
+        )
+        result = await workspace.execute_command(find_command, workspace.working_dir)
+        if result.exit_code:
+            _logger.warning(
+                f'Failed to find repository instruction files: {result.stderr}'
+            )
+            return []
+
+        dependency_repos: list[tuple[str, str]] = []
+        for instruction_path in (getattr(result, 'stdout', '') or '').splitlines():
+            instruction_path = instruction_path.strip()
+            if not instruction_path:
+                continue
+
+            read_result = await workspace.execute_command(
+                f'cat {shlex.quote(instruction_path)}',
+                workspace.working_dir,
+            )
+            if read_result.exit_code:
+                _logger.warning(
+                    f'Failed to read repository instruction file '
+                    f'{instruction_path}: {read_result.stderr}'
+                )
+                continue
+
+            frontmatter = extract_yaml_frontmatter(
+                getattr(read_result, 'stdout', '') or ''
+            )
+            if not frontmatter:
+                continue
+
+            dependency_repos.extend(
+                normalize_dependency_repos(frontmatter.get('dependency_repos'))
+            )
+
+        return dependency_repos
+
+    async def _clone_dependency_repos_from_repo_instructions(
+        self,
+        workspace: AsyncRemoteWorkspace,
+        project_dir: str,
+    ) -> None:
+        dependency_repos = await self._read_dependency_repos_from_repo_instructions(
+            workspace,
+            project_dir,
+        )
+        for directory, repository in dependency_repos:
+            try:
+                remote_repo_url = await self.user_context.get_authenticated_git_url(
+                    repository
+                )
+                if not remote_repo_url:
+                    _logger.warning(
+                        f'Skipping dependency repository {repository}: '
+                        'missing Git token or valid repository'
+                    )
+                    continue
+
+                clone_command = (
+                    f'git clone {shlex.quote(remote_repo_url)} '
+                    f'{shlex.quote(directory)}'
+                )
+                result = await workspace.execute_command(
+                    clone_command,
+                    workspace.working_dir,
+                    120,
+                )
+                if result.exit_code:
+                    _logger.warning(
+                        f'Dependency repository clone failed for {repository}: '
+                        f'{result.stderr}'
+                    )
+            except Exception as exc:
+                _logger.warning(
+                    f'Dependency repository clone failed for {repository}: {exc}'
+                )
 
     async def _get_azure_devops_bearer_token_for_git(
         self,
